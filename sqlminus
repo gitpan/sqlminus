@@ -1,0 +1,342 @@
+#!/usr/bin/perl
+# Filename: sqlminus
+$tstamp = "Time-stamp: <1999-04-01 17:17:40 ira>";
+#
+# Description: Very rudimentary commandline for Oracle SQL. Not as
+# rudimentary as SQL*Plus, however.
+#
+# Usage: sqlminus user/passwd
+#
+######################################################################
+#use diagnostics;
+
+$VERSION = "0.4.7";
+
+use Env;
+use Term::ReadLine;
+use Term::ReadKey;
+use DBI;
+
+print "\nSQL\*Minus: Release $VERSION (last edited $tstamp)\n";
+#print "\nCopyright (c) Ira Joseph Woodhead, Open Data Solutions 1998.\n";
+print "\nConnecting to database...\n\n";
+
+my $driver = DBI->install_driver('Oracle');
+my $database = $driver->connect('',@ARGV) 
+  or die "\$driver->connect: $DBI::errstr\n";
+
+# Added by Tom Cunningham for 'describe table', 'explain plan' commands.
+$describe_query = "select rpad(COLUMN_NAME, 32), ". 
+  "decode (NULLABLE, 'Y', '', 'N', 'NOT NULL') || ' ' || ".
+  "rtrim (DATA_TYPE) || '(' || rtrim (DATA_LENGTH) || ".
+  "rtrim(DATA_SCALE) || rtrim(DATA_PRECISION) || ')' ".
+  "from ALL_TAB_COLUMNS where TABLE_NAME = ?";
+
+$delete_from_plan_query = "delete from plan_table";
+
+$set_stmnt_query = "explain plan set statement_id=\'x\' for ";
+
+$explain_query = "SELECT ".
+        "rtrim (LPAD (' ',2*LEVEL)||'    '|| ".
+        "rtrim (OPERATION)||'    '|| ".
+        "rtrim (OPTIONS)||'    '|| ".
+        "rtrim (OBJECT_NAME)||'    '|| ".
+        "rtrim (OPTIMIZER)||'    '|| ".
+        "rtrim (OTHER_TAG)) EXPLAIN_PLAN ".
+	"FROM ".
+        "plan_table ".
+	"WHERE ".
+        "STATEMENT_ID = 'x' ".
+	"CONNECT BY ".
+        "PRIOR ID = PARENT_ID ".
+        "AND STATEMENT_ID = 'x' ".
+        "START WITH ID = 0";
+# end tom's patch.
+
+if( -e "/etc/quips" ){
+  open QUIPS, "</etc/quips";
+  my @quips = <QUIPS>;
+  close QUIPS;
+  print $quips[int rand scalar @quips], "\n";
+  undef @quips;
+}
+
+###########################TERM INITIALIZATION####################
+# Create a new terminal.
+my $term = new Term::ReadLine 'SQL-Minus';
+
+# Start a list of completion words, to be augmented later with table
+# names and field names.
+my @keywords = ('select','from','where','like','rownum');
+
+# Build a list of names of TABLEs and FIELDs from all the ones available
+# in the database, for use with SQL*Minus's completion features.
+my $obj_name_query = "SELECT table_name from user_tables";
+my $statement = $database->prepare($obj_name_query);
+unless (defined $statement){
+  print "Warning! Tablename completion not enabled: $DBI::errstr\n\n";
+}
+$statement->execute();
+$tablenames = ();
+while(($tablename) = $statement->fetchrow_array){
+  push(@tablenames, lc($tablename));
+}
+$statement->finish();
+
+# Build the field names.
+@rownames = ();
+foreach $tablename (@tablenames) {
+  $row_name_query = "SELECT * from $tablename where 0 = 1";
+  $statement = $database->prepare($row_name_query);
+  next unless defined $statement;
+  $statement->execute();
+  push @rownames, map {lc $_} @{ $statement->{'NAME'} };
+  $statement->finish;
+}
+
+# Set the completion function for the ReadLine library. Messy but allows
+# for expansion of grammatical capabilities later.
+$readline'rl_completion_function = "main'my_complete";
+
+# Read in the history from the previous session(s).
+if(-e "$ENV{'HOME'}/.sqlminus_history"){
+  open HIST, "<$ENV{'HOME'}/.sqlminus_history";
+  while(<HIST>){
+    chop;
+    $term->addhistory($_);
+  }
+}
+
+########################END TERM INIT######################
+
+
+# Ready to take input from terminal now.
+
+while(defined($_ = $term->readline('SQL-Minus> '))){
+
+#Do some parsing of the commands.
+  next if !/\S/;
+  if( !/;/ ){ #Allow multiline commands. (Not multicommand lines...)
+    $line = 2;
+    while($_ .= ' ' . $term->readline("\t$line ")){
+      last if /;/;
+      $line++;
+    }
+  }
+  if( /;\s*\S/ ){
+    print <<"EOL"
+      No multiple queries in one command please! 
+      (If this is important to you, email 
+      ira\@wrath.odsnet.com to request it)
+EOL
+}
+
+# Squeeze spaces together.
+  s/\s+/ /g;
+# Remember this command. (commented because automatic now)
+#  $term->addhistory($_);
+  system "echo \'$_\' >> $ENV{'HOME'}/.psql_history";
+# Strip trailing semicolon and space
+  s/;\s*$//;
+  
+# (ADDED 99-02-25) to dump results as in MySQL. Strip out clause and remember filename. 
+  $dumpfile = "";
+  if($_ =~ s| into outfile (\S+) from | from |i){
+    $dumpfile = $1;
+  }
+
+# Prepare the command
+# (First check for 'describe table', 'explain plan' thanks Tom.
+  if (s/^describe //i or s|^desc ||i) {
+    $statement = $database->prepare($describe_query);
+    $statement->bind_param(1, $_);
+  } elsif (s/^explain plan //i) {
+	# Clear the plan_table
+	$delete_sth = $database->prepare($delete_from_plan_query) or 
+	  die "Attempt to clear plan failed ($DBI::errstr)\n";	
+	$delete_sth->execute;
+	$delete_sth->finish;
+
+	# Add rows to the plan_table	
+	$set_stmnt_sth = $database->prepare("$set_stmnt_query $_");
+	$set_stmnt_sth->execute;
+	$set_stmnt_sth->finish;
+
+	$statement = $database->prepare($explain_query);
+#############
+  } elsif (m/^@(\S+)(\s*)$/) {
+	unless (open (INFILE, "$ENV{'HOME'}/$1.sql") ) {
+		print "Cannot find file $ENV{'HOME'}/$1.sql\n\n";
+		next; 
+	}
+	
+	while (<INFILE>) {
+		# There's probably a mucho better way to join 2 strings 
+		# in perl. This is ugly but it works. Optimize me please... :)
+		$read_query .= $_;  
+		# There ya go! -i
+	}
+	close (INFILE);
+
+	chomp $read_query;	
+	$read_query =~ s/;$//;
+	$statement = $database->prepare ($read_query);	
+
+	unless (defined $statement) {
+	 print "$DBI::errstr\n\n";
+      	 next;
+	}
+
+############
+  } else { 
+    $statement = $database->prepare($_);
+    unless (defined $statement){
+      print "$DBI::errstr\n\n";
+      next;
+    }
+  }
+
+  $statement->execute;
+
+  if( $dumpfile ){
+    open DUMP, ">$dumpfile" 
+      or print "Could not open dumpfile $dumpfile\n" && last;
+    while(@row = $statement->fetchrow_array){
+      foreach (@row){ s|\t|\\\t| }
+      print DUMP join("\t", @row), "\n"; 
+    } 
+    close DUMP;
+    $dumpfile = "";
+    $statement->finish;
+    next;
+  }
+
+# Print everything to the screen in 'more' or 'less' style.
+
+# print the names of the fields.
+  print "\n", join("\t", @{ $statement->{NAME} }), "\n";
+  
+# Get the size of the terminal
+  ($width,$height) = GetTerminalSize; # Actually a 4-item list.
+  print "-*" x int($width/2), "\n";
+  
+# Print one screen.
+  $linecount = 0;
+  while(@row = $statement->fetchrow_array){
+    print join("\t",@row), "\n"; 
+    last if $linecount++ >= ($height - 4);
+  } 
+
+# Put terminal in cbreak mode:
+  ReadMode 'cbreak';
+
+  while (
+	 (@testrow = $statement->fetchrow_array)
+	 and 
+	 ($keystroke = ReadKey(0)) 
+	){
+
+# One screenful for SPC.
+    if($keystroke =~ m|^ $|){
+      $i = 0;
+      print join("\t",@testrow), "\n"; 
+      $linecount++;
+      $i++;
+      while(@row = $statement->fetchrow_array){
+	print join("\t",@row), "\n"; 
+	$linecount++;
+	last if $i++ >= ($height - 2);
+      } 
+      next;
+    }
+
+# One line for CR.
+    if($keystroke =~ m|^\n$|){ 
+      print join("\t",@testrow), "\n";
+      $linecount++;
+      next;
+    }
+
+# All the rest for C(ontinue).
+    if($keystroke =~ m|^[cC]$|){
+      print join("\t",@testrow), "\n"; 
+      $linecount++;
+      while(@row = $statement->fetchrow_array){
+	print join("\t",@row), "\n"; 
+	$linecount++;
+      }
+      last;
+    }
+
+# Skip all for Q(uit).
+    if($keystroke =~ m|^[qQ]$|){ 
+
+# Just count the lines, don't print them
+      $linecount++; # <- for @testrow.
+      while($statement->fetchrow_array){
+	$linecount++;
+      }
+      last;
+    }
+
+
+  } # while($keystroke = ...) 
+
+# Restore terminal to normal.
+  ReadMode 'normal';
+
+# Print further info.
+  print "\n$linecount rows selected.\n\n";
+
+# Close up the query.
+  $statement->finish or print "Could not finish() statement handle ($DBI::errstr)\n";
+} # while( defined( $_ = ...))
+
+
+$database->disconnect;
+$driver->disconnect_all;
+
+exit 0;
+
+
+# my_complete is used by the Perl readline library. It takes the word
+# immediately to the left of the cursor ($text), the entire line
+# ($line), and the position in the line of the cursor ($start). It
+# returns a list of possible completions.
+sub my_complete {
+  my ($text, $line, $start) = @_;
+  grep(/^$text/, (@keywords, @tablenames, @rownames));
+}
+
+
+
+=head1 NAME
+
+       sqlminus - Replacement for SQL*Plus.
+
+=head1 SYNOPSIS
+
+       sqlminus username/passwd
+
+=head1 DESCRIPTION
+
+       Implements multi-session command line history and completion, 
+       less-style paging of results, simple file dump, DESCRIBE TABLE, 
+       EXPLAIN PLAN, and some other stuff.
+
+=head1 AUTHOR and COPYRIGHT
+
+       Copyright (c) 1999 Ira Joseph Woodhead, iAtlas Corp.
+       ira@iatlas.com
+
+       This is free software.  You may modify it and distribute
+       it under Perl's Artistic Licence.  Modified versions must
+       be clearly indicated.
+
+
+=head1 SEE ALSO
+
+       sqlplus
+
+=cut
+
